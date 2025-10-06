@@ -1,0 +1,91 @@
+# virtual env, caches
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+
+# outputs (baseline + tuned)
+wapor_20m_local/outputs_rf20_auto/
+wapor_20m_local/outputs_rf20_fs_fwd/
+wapor_20m_any_aoi/
+
+# per-run artifacts (do not ignore code)
+**/preds/
+**/viz/
+**/metrics.csv
+**/metrics*.csv
+**/feature_importances.csv
+**/rf_fs_meta.json
+**/rf_model.joblib
+**/features.json
+**/*_pred.tif
+**/*_pred_clip.tif
+**/*_eta300_clip.tif
+**/*_label_clip.tif
+**/*_pred_vs_eta300.png
+**/*native_vs_pred*png
+**/*pred_minus_native*png
+**/accuracy_timeseries.png
+**/scatter_pred_vs_native.png
+
+# Ignore dekad stack GeoTIFFs (training/test inputs)
+wapor_20m_local/**/*_stack.tif
+wapor_20m_local/**/*_stack_*.tif
+
+# (or target just these folders explicitly)
+wapor_20m_local/BAIXO/*_stack*.tif
+wapor_20m_local/LAMEGO/*_stack*.tif
+# (optional) local secrets/config
+
+# --- training/test stacks (dekad GeoTIFFs) ---
+wapor_20m_local/**/*_stack*.tif
+wapor_20m_any_aoi/**/*_stack*.tif
+
+# predictions & clips
+**/*_pred.tif
+**/*_pred_clip.tif
+**/*_label_clip.tif
+**/*_eta300_clip.tif
+
+# viz PNGs
+**/viz/**/*.png
+**/*_native_vs_pred_*_minmax.png
+**/*_pred_minus_native_*_robust.png
+# Uncomment if you accidentally committed SA keys (better keep them outside the repo)
+# *.json
+
+# --- Local training/test stacks (very large) ---
+wapor_20m_local/BAIXO/*_stack*.tif
+wapor_20m_local/LAMEGO/*_stack*.tif
+
+# --- Run outputs (baseline/tuned) ---
+# predictions & clips
+wapor_20m_local/**/preds/*.tif
+wapor_20m_local/**/preds/*_clip.tif
+
+# visualisations
+wapor_20m_local/**/viz/*.png
+**/*_native_vs_pred_*_minmax.png
+**/*_pred_minus_native_*_robust.png
+
+# --- Any-AOI single-date runs ---
+wapor_20m_any_aoi/**/*_stack*.tif
+wapor_20m_any_aoi/**/preds/*.tif
+wapor_20m_any_aoi/**/preds/*_clip.tif
+wapor_20m_any_aoi/**/viz/*.png
+
+# --- Optional: model artifacts/metadata (uncomment if you don't want them tracked) ---
+# wapor_20m_local/**/feature_importances.csv
+# wapor_20m_local/**/features.json
+# wapor_20m_local/**/rf_model.joblib
+
+
+
+
+
+
+# --- Usual clutter ---
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
