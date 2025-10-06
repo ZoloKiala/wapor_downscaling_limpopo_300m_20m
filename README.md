@@ -45,6 +45,3 @@ python predict_any_aoi.py \
 ## Outputs
 - Local GeoTIFF stacks: `wapor_20m_local/BAIXO/`, `wapor_20m_local/LAMEGO/`
 - Model + results: `wapor_20m_local/outputs_rf20_auto/`
-# wapor_downscaling_limpopo_300m_20m
-# wapor_downscaling_limpopo_300m_20m
-# wapor_downscaling_limpopo_300m_20m
