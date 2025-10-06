@@ -81,8 +81,9 @@ L3_LAMEGO_D_COLL = "projects/tethys-app-1/assets/WaPOR_L3_20m_D_LAMEGO"
 LABEL_BAND       = "b1"   # change if your label band name differs
 
 # Windows
-TRAIN_START = "2018-01-01"; TRAIN_END = "2018-02-01"
-TEST_START  = "2019-01-01"; TEST_END  = "2019-02-11"
+TRAIN_START = "2018-01-01"; TRAIN_END = "2024-12-01"
+TEST_START  = "2019-01-01"; TEST_END  = "2022-12-21"
+
 
 # Local output root
 OUTPUT_ROOT = Path("wapor_20m_local")
