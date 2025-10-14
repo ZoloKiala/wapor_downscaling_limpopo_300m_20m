@@ -7,14 +7,18 @@ WaPOR 20 m Downscaling — Local Machine Edition
 
 Notes:
 - Requires a Google Earth Engine service account key JSON locally accessible.
-  You can set the env var EE_SERVICE_ACCOUNT_FILE to point to it, or keep the default filename in this folder.
+  Set env var EE_SERVICE_ACCOUNT_FILE to point to it.
 """
 
 import os
+# Silence geedim shutdown noise on some Python builds
+os.environ.setdefault("GD_DISABLE_ASYNC", "1")
+
 import re
 import glob
 import json
 import math
+import argparse
 import datetime as dt
 from pathlib import Path
 
@@ -36,82 +40,103 @@ SCOPES = [
     "https://www.googleapis.com/auth/earthengine",
     "https://www.googleapis.com/auth/drive",
 ]
-credentials = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE, scopes=SCOPES
-)
-ee.Initialize(credentials)
+
+def ee_init():
+    if not SERVICE_ACCOUNT_FILE or not os.path.isfile(SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(
+            "EE_SERVICE_ACCOUNT_FILE not set or file not found. "
+            "Set it to your service account JSON path."
+        )
+    credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    )
+    ee.Initialize(credentials)
 
 # ---------- CONFIG ----------
-# AOIs (Earth Engine FeatureCollections)
 BAIXO_AOI  = "projects/tethys-app-1/assets/baixo"
 LAMEGO_AOI = "projects/tethys-app-1/assets/lamego"
 
-# Label image collections (dekadal WaPOR L3 at 20 m, per-region)
 L3_BAIXO_D_COLL  = "projects/tethys-app-1/assets/WaPOR_L3_20m_D_BAIXO"
 L3_LAMEGO_D_COLL = "projects/tethys-app-1/assets/WaPOR_L3_20m_D_LAMEGO"
-LABEL_BAND       = "b1"   # change if your label band name differs
+LABEL_BAND       = "b1"
 
-# Windows
-TRAIN_START = "2018-01-01"; TRAIN_END = "2024-12-01"
-TEST_START  = "2019-01-01"; TEST_END  = "2022-12-21"
+TRAIN_START_DEFAULT = "2018-01-01"; TRAIN_END_DEFAULT = "2024-12-01"   # [start, end)
+TEST_START_DEFAULT  = "2019-01-01"; TEST_END_DEFAULT  = "2022-12-21"   # inclusive
 
-# Local output root
+TRAIN_START = TRAIN_START_DEFAULT
+TRAIN_END   = TRAIN_END_DEFAULT
+TEST_START  = TEST_START_DEFAULT
+TEST_END    = TEST_END_DEFAULT
+
 OUTPUT_ROOT = Path("wapor_20m_local")
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Export / raster settings
 EXPORT_SCALE       = 20
 EXPORT_DTYPE       = "float32"
 EXPORT_NODATA      = -9999
-GEEDIM_TILE_MB     = 16   # must be < 32
+GEEDIM_TILE_MB     = 16
 GEEDIM_MAX_REQUEST = 16
+MIN_VALID_BYTES    = 1024  # consider files smaller than this as incomplete
 
-# Predictors (EE sources)
-S2_SR        = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-L1_AETI_D    = ee.ImageCollection("FAO/WAPOR/3/L1_AETI_D")
-DEM          = ee.Image("USGS/SRTMGL1_003").rename("DEM")
-SLOPE        = ee.Terrain.slope(DEM).rename("Slope")
-LANDCOVER    = ee.ImageCollection("ESA/WorldCover/v200").first().select("Map").rename("LC")
+S1_VALUES_ARE_DB = True
+S1_SMOOTH_RADIUS = 1
+TEXTURE_SIZE     = 3
+DB_MIN, DB_MAX   = -25.0, 5.0
 
-# Sentinel-1 & CHIRPS
-S1_GRD       = (ee.ImageCollection("COPERNICUS/S1_GRD")
-                 .filter(ee.Filter.eq("instrumentMode", "IW"))
-                 .filter(ee.Filter.listContains("transmitterReceiverPolarisation","VV"))
-                 .filter(ee.Filter.listContains("transmitterReceiverPolarisation","VH")))
-CHIRPS_DAILY = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")  # mm/day
-
-# --- Sentinel-1 / Texture toggles ---
-S1_VALUES_ARE_DB = True   # COPERNICUS/S1_GRD is usually in dB; if not, set to False to convert
-S1_SMOOTH_RADIUS = 1      # pixels; light speckle smoothing on dB
-TEXTURE_SIZE     = 3      # window (pixels) for GLCM textures
-DB_MIN, DB_MAX   = -25.0, 5.0  # range used to quantize to 8-bit for GLCM
-
-# Map human-friendly names → EE glcmTexture suffixes
 GLCM_MAP = {
     "contrast":      "contrast",
     "entropy":       "ent",
-    "homogeneity":   "idm",   # inverse difference moment
+    "homogeneity":   "idm",
     "dissimilarity": "diss",
 }
 
-# CHIRPS lag settings
 CHIRPS_LAG_DAYS = 10
 
-# AOIs
-BAIXO  = ee.FeatureCollection(BAIXO_AOI)
-LAMEGO = ee.FeatureCollection(LAMEGO_AOI)
+# ------------------ PATHS ------------------
+DATA_DIR   = "wapor_20m_local"
+TRAIN_DIR  = None
+TEST_DIR   = None
 
-# Label ICs
-L3_BAIXO_D  = (ee.ImageCollection(L3_BAIXO_D_COLL)
-               .filterBounds(BAIXO)
-               .filterDate(TRAIN_START, TRAIN_END))
-L3_LAMEGO_D = (ee.ImageCollection(L3_LAMEGO_D_COLL)
-               .filterBounds(LAMEGO)
-               .filterDate(TEST_START, TEST_END))
+OUT_DIR    = os.path.join(DATA_DIR if TRAIN_DIR is None else TRAIN_DIR, "outputs_rf20_auto")
+PRED_DIR   = os.path.join(OUT_DIR, "preds")
+VIS_DIR    = os.path.join(OUT_DIR, "viz")
+os.makedirs(OUT_DIR, exist_ok=True); os.makedirs(PRED_DIR, exist_ok=True); os.makedirs(VIS_DIR, exist_ok=True)
+
+# ------------------ SAMPLING / RF CONFIG ------------------
+PER_FILE_SAMPLES  = 300
+CHUNK_PRED        = 1024
+RANDOM_STATE      = 7
+NODATA_OUT        = -9999.0
+
+DO_ONE_HOT_LC     = True
+USE_DAY_OF_YEAR   = True
+MAX_LC_UNIQUE     = 20
+
+MAX_SCAN_FILES    = 200
+PCT_REQUIRED      = 0.90
+
+LABEL_CANDIDATES  = ("b1","ETa20","ETa20m","AETI20","L3","LABEL","label")
+
+RF_PARAMS = dict(
+    n_estimators=600, max_depth=None, min_samples_split=2, min_samples_leaf=1,
+    max_features="sqrt", n_jobs=-1, random_state=RANDOM_STATE,
+    bootstrap=True, max_samples=0.8, oob_score=True,
+    warm_start=False
+)
+
+np.random.seed(RANDOM_STATE)
+
+# ---------- EE SOURCES (late-bound) ----------
+S2_SR = None
+L1_AETI_D = None
+DEM = None
+SLOPE = None
+LANDCOVER = None
+S1_GRD = None
+CHIRPS_DAILY = None
 
 # ---------- HELPERS ----------
 def end_of_dekad_from_label_start(date):
-    """Exclusive end date for dekad starting at date (1st→11th→21st→next month)."""
     d = ee.Number(ee.Date(date).get('day'))
     is_third = d.gte(21)
     return ee.Date(ee.Algorithms.If(is_third, ee.Date(date).advance(1,'month'),
@@ -137,7 +162,6 @@ def to_db(img_lin):
     return img_lin.log10().multiply(10.0)
 
 def s1_textures_from_db(vvdb, vhdb, size=TEXTURE_SIZE, db_min=DB_MIN, db_max=DB_MAX):
-    """Compute GLCM textures on 8-bit quantized dB images."""
     def q8(img, name_u8):
         return (img.unitScale(db_min, db_max)
                     .multiply(255).clamp(0, 255).toUint8().rename(name_u8))
@@ -154,21 +178,13 @@ def s1_textures_from_db(vvdb, vhdb, size=TEXTURE_SIZE, db_min=DB_MIN, db_max=DB_
     return ee.Image.cat(vv_list + vh_list)
 
 def s1_dekad_safe(start, end, region):
-    """
-    Median VV/VH over dekad (dB), light smoothing, VV−VH, and GLCM textures.
-    Returns all S1 bands (including textures). Empty dekad → fully masked zeros.
-    """
     coll = S1_GRD.filterBounds(region).filterDate(start, end)
 
     def _make():
         vv = coll.select("VV").median()
         vh = coll.select("VH").median()
-        if S1_VALUES_ARE_DB:
-            vvdb = vv
-            vhdb = vh
-        else:
-            vvdb = to_db(vv)
-            vhdb = to_db(vh)
+        vvdb = vv if S1_VALUES_ARE_DB else to_db(vv)
+        vhdb = vh if S1_VALUES_ARE_DB else to_db(vh)
         vvdb_s = vvdb.focal_mean(radius=S1_SMOOTH_RADIUS, units="pixels").rename("S1_VV_dB")
         vhdb_s = vhdb.focal_mean(radius=S1_SMOOTH_RADIUS, units="pixels").rename("S1_VH_dB")
         diff   = vvdb.subtract(vhdb).focal_mean(radius=S1_SMOOTH_RADIUS, units="pixels").rename("S1_VVminusVH_dB")
@@ -184,7 +200,7 @@ def s1_dekad_safe(start, end, region):
     return ee.Image(ee.Algorithms.If(coll.size().gt(0), _make(), masked))
 
 def chirps_sum(start, end, band_name):
-    coll = CHIRPS_DAILY.filterDate(start, end).select("precipitation")  # mm/day
+    coll = CHIRPS_DAILY.filterDate(start, end).select("precipitation")
     img  = coll.sum().rename(band_name)
     return ee.Image(ee.Algorithms.If(coll.size().gt(0),
                                      img, ee.Image(0).updateMask(ee.Image(0)).rename(band_name)))
@@ -197,7 +213,6 @@ def chirps_dekad_pair(start, end):
     return cur.addBands(lag)
 
 def build_stack_for_label(label_img, region_fc, include_label=True):
-    """Return (stack, startDate) with fixed band order expected by local pipeline."""
     lbl   = ee.Image(label_img).select([0]).rename([LABEL_BAND])
     start = ee.Date(lbl.get("system:time_start"))
     end   = end_of_dekad_from_label_start(start)
@@ -221,16 +236,27 @@ def build_stack_for_label(label_img, region_fc, include_label=True):
         stack = stack.addBands(lbl)
     return stack, start
 
-# ---------- LOCAL EXPORT WITH GEEDIM ----------
+# ---------- EXPORT ----------
 def export_ic_local_geedim(label_ic, region_fc, region_name, subfolder,
                            include_label=True, scale=EXPORT_SCALE,
                            dtype=EXPORT_DTYPE, nodata_val=EXPORT_NODATA,
-                           max_tile_size_mb=GEEDIM_TILE_MB, max_requests=GEEDIM_MAX_REQUEST):
+                           max_tile_size_mb=GEEDIM_TILE_MB, max_requests=GEEDIM_MAX_REQUEST,
+                           overwrite=False):
     """
-    Download each dekad stack as a single GeoTIFF to OUTPUT_ROOT/subfolder using geedim.
+    Download each dekad stack as a single GeoTIFF to OUTPUT_ROOT/subfolder.
+    Skips existing files (size > MIN_VALID_BYTES) unless overwrite=True.
+    Safely skips empty label collections.
     """
+    try:
+        n = int(ee.Number(label_ic.size()).getInfo())
+    except Exception as e:
+        print(f"[SKIP] {region_name}: couldn't determine collection size — likely empty/invalid. {e}")
+        return
+    if n == 0:
+        print(f"[SKIP] {region_name}: label collection is empty for the given window.")
+        return
+
     ic   = label_ic.sort("system:time_start")
-    n    = ic.size().getInfo()
     lst  = ic.toList(n)
     geom = region_fc.geometry()
 
@@ -244,77 +270,32 @@ def export_ic_local_geedim(label_ic, region_fc, region_name, subfolder,
         fname    = f"{region_name}_{date_str}_stack.tif"
         fpath    = str(out_dir / fname)
 
-        prepared = (stack.clip(geom)
-                         .gd.prepareForExport(region=geom, scale=scale, dtype=dtype))
+        # --- robust skip check ---
+        if os.path.exists(fpath) and not overwrite:
+            try:
+                if os.path.getsize(fpath) > MIN_VALID_BYTES:
+                    print(f"[SKIP EXISTING] {fpath}")
+                    continue
+                else:
+                    print(f"[RE-DOWNLOAD SMALL FILE] {fpath} ({os.path.getsize(fpath)} bytes)")
+            except OSError:
+                pass  # fall through to re-download
+
+        prepared = (stack.clip(geom).gd.prepareForExport(region=geom, scale=scale, dtype=dtype))
         try:
             prepared.gd.toGeoTIFF(
                 fpath,
-                overwrite=True,
+                overwrite=True if overwrite else False,  # we already gate with our own check
                 nodata=nodata_val,
-                max_tile_size=max_tile_size_mb,  # MB, must be < 32
+                max_tile_size=max_tile_size_mb,
                 max_requests=max_requests
             )
             print("Saved:", fpath)
         except Exception as e:
             print(f"[WARN] Failed {fname}: {e}")
 
-# ============================================================
-# WaPOR 20 m Downscaling — RandomForest (auto features)
-# ============================================================
-
-# ------------------ PATHS ------------------
-# Option A: one folder containing both BAIXO and LAMEGO stacks (default from exporter)
-DATA_DIR   = "wapor_20m_local"  # contains subfolders BAIXO/ and LAMEGO/
-
-# Option B: override explicit train/test folders (each with *stack*.tif files)
-TRAIN_DIR  = None               # e.g. "wapor_20m_local/BAIXO"
-TEST_DIR   = None               # e.g. "wapor_20m_local/LAMEGO"
-
-OUT_DIR    = os.path.join(DATA_DIR if TRAIN_DIR is None else TRAIN_DIR, "outputs_rf20_auto")
-PRED_DIR   = os.path.join(OUT_DIR, "preds")
-VIS_DIR    = os.path.join(OUT_DIR, "viz")
-os.makedirs(OUT_DIR, exist_ok=True); os.makedirs(PRED_DIR, exist_ok=True); os.makedirs(VIS_DIR, exist_ok=True)
-
-# ------------------ DATES (used when TRAIN_DIR/TEST_DIR are None) ------------------
-# For your exporter, filenames look like: Region_YYYY-MM-DD_stack.tif
-# Set windows for BAIXO (train) and LAMEGO (test), or let fallback 70/30 split handle it.
-TRAIN_START = "2018-01-01"; TRAIN_END = "2018-01-21"   # [start, end)
-TEST_START  = "2019-01-01"; TEST_END  = "2019-0-21"   # inclusive
-
-# ------------------ SAMPLING / RF CONFIG ------------------
-PER_FILE_SAMPLES  = 300
-CHUNK_PRED        = 1024
-RANDOM_STATE      = 7
-NODATA_OUT        = -9999.0
-
-# Feature options
-DO_ONE_HOT_LC     = True
-USE_DAY_OF_YEAR   = True
-MAX_LC_UNIQUE     = 20
-
-# Auto-feature discovery controls
-MAX_SCAN_FILES    = 200      # scan up to N training files for band presence
-PCT_REQUIRED      = 0.90     # keep predictors appearing in ≥90% of scanned training files
-
-# Label band candidates (your exporter ends with label 'b1')
-LABEL_CANDIDATES  = ("b1","ETa20","ETa20m","AETI20","L3","LABEL","label")
-
-# Random Forest (strong but not overfit)
-RF_PARAMS = dict(
-    n_estimators=600, max_depth=None, min_samples_split=2, min_samples_leaf=1,
-    max_features="sqrt", n_jobs=-1, random_state=RANDOM_STATE,
-    bootstrap=True, max_samples=0.8, oob_score=True,
-    warm_start=False
-)
-
-np.random.seed(RANDOM_STATE)
-
-# ------------------ Helper utilities for RF ------------------
+# ------------------ RF utilities ------------------
 def parse_any_date(text):
-    """
-    Return (YYYY-MM-DD, DOY) parsed from filename.
-    Supports YYYY-MM-DD, YYYY_MM_DD, YYYYMMDD.
-    """
     m = re.search(r'(\d{4})[-_](\d{2})[-_](\d{2})', text)
     if not m:
         m = re.search(r'(\d{4})(\d{2})(\d{2})', text)
@@ -336,11 +317,6 @@ def in_range(date_str, start, end, inclusive_end=False):
     return (ds <= d <= de) if inclusive_end else (ds <= d < de)
 
 def discover_files():
-    """
-    Return (train_files, test_files).
-    If TRAIN_DIR/TEST_DIR given → use them.
-    Else: search in DATA_DIR subfolders BAIXO/, LAMEGO/; if missing, search DATA_DIR directly and split by date.
-    """
     if TRAIN_DIR and TEST_DIR:
         train = sorted(glob.glob(os.path.join(TRAIN_DIR, "*stack*.tif")))
         test  = sorted(glob.glob(os.path.join(TEST_DIR , "*stack*.tif")))
@@ -348,7 +324,6 @@ def discover_files():
         print(f"[DISCOVERY] TEST_DIR ={TEST_DIR } -> {len(test)} files")
         return train, test
 
-    # prefer BAIXO for train and LAMEGO for test if present
     baixo_dir  = os.path.join(DATA_DIR, "BAIXO")
     lamego_dir = os.path.join(DATA_DIR, "LAMEGO")
     if os.path.isdir(baixo_dir) and os.path.isdir(lamego_dir):
@@ -357,7 +332,6 @@ def discover_files():
         print(f"[DISCOVERY] BAIXO={len(train)} | LAMEGO={len(test)}")
         return train, test
 
-    # otherwise, all in one folder → split by dates
     files = sorted(glob.glob(os.path.join(DATA_DIR, "*stack*.tif")))
     print(f"[DISCOVERY] DATA_DIR={DATA_DIR}, found {len(files)} stack files")
     if not files:
@@ -390,7 +364,6 @@ def discover_files():
     return train, test
 
 def band_map(ds):
-    """Map band name -> zero-based index using Rasterio band descriptions."""
     desc = list(ds.descriptions or [])
     return {desc[i]: i for i in range(ds.count) if i < len(desc) and desc[i]}
 
@@ -403,7 +376,7 @@ def read_label_band(ds, bm=None):
     bm = bm or band_map(ds)
     nm = guess_label_name(bm)
     if nm is None:
-        return ds.read(ds.count).astype(np.float32)  # fallback: last band
+        return ds.read(ds.count).astype(np.float32)
     return ds.read(bm[nm]+1).astype(np.float32)
 
 # ------------------ Feature discovery ------------------
@@ -427,10 +400,6 @@ def discover_predictor_names(train_files,
                              use_day=USE_DAY_OF_YEAR,
                              max_scan=MAX_SCAN_FILES,
                              pct_required=PCT_REQUIRED):
-    """
-    Scan training files: collect band names excluding label, keep those present in ≥ pct_required
-    of scanned files. Add DOY and LC one-hot (expanded later) if requested.
-    """
     counts = Counter()
     total  = 0
     for fp in train_files[:max_scan]:
@@ -447,7 +416,6 @@ def discover_predictor_names(train_files,
 
     keep_raw = sorted([nm for nm, c in counts.items() if c / total >= pct_required])
 
-    # Land cover OHE list (will expand names later)
     lc_values = None
     keep = keep_raw[:]
     if do_one_hot and "LC" in keep_raw:
@@ -475,22 +443,18 @@ def sample_from_stack(path, feature_names, n=2000, lc_values=None):
                 continue
             needed_raw.add(f)
 
-        # load needed arrays; bail if a required band is missing
         arrs = {}
         for name in needed_raw:
             if name not in bm:
-                # band not present -> skip this file
                 return None, None
             arrs[name] = ds.read(bm[name]+1).astype(np.float32)
 
-    # day-of-year
     base = os.path.basename(path)
     date_str, doy = parse_any_date(base)
     angle   = 2.0 * np.pi * ((doy or 1) / 365.0)
     day_sin = np.float32(np.sin(angle))
     day_cos = np.float32(np.cos(angle))
 
-    # build validity mask
     for f in feature_names:
         if f.startswith("LC_"):
             if "LC" not in arrs: return None, None
@@ -512,7 +476,7 @@ def sample_from_stack(path, feature_names, n=2000, lc_values=None):
     for f in feature_names:
         if f.startswith("LC_"):
             code = int(f.split("_",1)[1])
-            lc = arrs["LC"][ys, xs].astype(np.int32)
+            lc = arrs["LC"][ys, xs].astype(np.int32)  # safe: mask already finite
             cols.append((lc == code).astype(np.float32))
         elif f == "DAY_SIN":
             cols.append(np.full_like(ys, day_sin, dtype=np.float32))
@@ -579,9 +543,13 @@ def predict_stack_blockwise(fp_in, rf, feature_names, fp_out, lc_values=None,
                     feats = []
                     for f in feature_names:
                         if f.startswith("LC_"):
-                            code = int(f.split("_",1)[1])
-                            a = raw["LC"].astype(np.int32)
-                            feats.append((a == code).astype(np.float32))
+                            # NaN-safe LC one-hot
+                            code = int(f.split("_", 1)[1])
+                            a = raw["LC"]
+                            a_i = np.full_like(a, -9999, dtype=np.int32)
+                            valid_mask = np.isfinite(a)
+                            a_i[valid_mask] = a[valid_mask].astype(np.int32)
+                            feats.append((a_i == code).astype(np.float32))
                         elif f == "DAY_SIN":
                             feats.append(np.full((h0,w0), day_sin, dtype=np.float32))
                         elif f == "DAY_COS":
@@ -589,7 +557,7 @@ def predict_stack_blockwise(fp_in, rf, feature_names, fp_out, lc_values=None,
                         else:
                             feats.append(raw[f])
 
-                    block = np.stack(feats, axis=0)               # (F, h0, w0)
+                    block = np.stack(feats, axis=0)
                     X = np.moveaxis(block, 0, -1).reshape(-1, len(feature_names))
                     valid = np.isfinite(X).all(axis=1)
                     pred = np.full((X.shape[0],), np.nan, np.float32)
@@ -635,7 +603,6 @@ def visualise_minmax_robust(pred_clip, label_clip, out_dir, tag, title_prefix="R
     if ndl is not None: valid &= (t != ndl)
     pm = np.ma.array(p, mask=~valid); tm = np.ma.array(t, mask=~valid)
 
-    # robust shared min/max
     vmin = float(np.min([pm.min(), tm.min()])) if pm.count() and tm.count() else 0.0
     vmax = float(np.max([pm.max(), tm.max()])) if pm.count() and tm.count() else 8.0
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax: vmin, vmax = 0.0, 8.0
@@ -684,10 +651,55 @@ def metrics_from_pair(pred_clip, label_clip):
 
 # ------------------ MAIN FLOW ------------------
 def main():
-    # 0) Export (once) — comment these two lines out if you already have local stacks
-    export_ic_local_geedim(L3_BAIXO_D , BAIXO , "Baixo" , "BAIXO",  include_label=True)
-    export_ic_local_geedim(L3_LAMEGO_D, LAMEGO, "Lamego", "LAMEGO", include_label=True)
-    print("All local exports done.")
+    global TRAIN_START, TRAIN_END, TEST_START, TEST_END
+    global S2_SR, L1_AETI_D, DEM, SLOPE, LANDCOVER, S1_GRD, CHIRPS_DAILY
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--skip-export", action="store_true",
+                        help="Skip exporting stacks (use whatever is already in wapor_20m_local).")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Force re-download of stacks that already exist.")
+    parser.add_argument("--train-start", type=str, default=None)
+    parser.add_argument("--train-end",   type=str, default=None)
+    parser.add_argument("--test-start",  type=str, default=None)
+    parser.add_argument("--test-end",    type=str, default=None)
+    args = parser.parse_args()
+
+    TRAIN_START = args.train_start or TRAIN_START_DEFAULT
+    TRAIN_END   = args.train_end   or TRAIN_END_DEFAULT
+    TEST_START  = args.test_start  or TEST_START_DEFAULT
+    TEST_END    = args.test_end    or TEST_END_DEFAULT
+
+    ee_init()
+
+    S2_SR        = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    L1_AETI_D    = ee.ImageCollection("FAO/WAPOR/3/L1_AETI_D")
+    DEM          = ee.Image("USGS/SRTMGL1_003").rename("DEM")
+    SLOPE        = ee.Terrain.slope(DEM).rename("Slope")
+    LANDCOVER    = ee.ImageCollection("ESA/WorldCover/v200").first().select("Map").rename("LC")
+    S1_GRD       = (ee.ImageCollection("COPERNICUS/S1_GRD")
+                     .filter(ee.Filter.eq("instrumentMode", "IW"))
+                     .filter(ee.Filter.listContains("transmitterReceiverPolarisation","VV"))
+                     .filter(ee.Filter.listContains("transmitterReceiverPolarisation","VH")))
+    CHIRPS_DAILY = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+
+    BAIXO  = ee.FeatureCollection(BAIXO_AOI)
+    LAMEGO = ee.FeatureCollection(LAMEGO_AOI)
+
+    L3_BAIXO_D  = (ee.ImageCollection(L3_BAIXO_D_COLL)
+                   .filterBounds(BAIXO)
+                   .filterDate(TRAIN_START, TRAIN_END))
+    L3_LAMEGO_D = (ee.ImageCollection(L3_LAMEGO_D_COLL)
+                   .filterBounds(LAMEGO)
+                   .filterDate(TEST_START, TEST_END))
+
+    # 0) Export
+    if args.skip_export:
+        print("[EXPORT] Skipped by flag --skip-export")
+    else:
+        export_ic_local_geedim(L3_BAIXO_D , BAIXO , "Baixo" , "BAIXO",  include_label=True, overwrite=args.overwrite)
+        export_ic_local_geedim(L3_LAMEGO_D, LAMEGO, "Lamego", "LAMEGO", include_label=True, overwrite=args.overwrite)
+        print("All local exports done.")
 
     # 1) files
     train_files, test_files = discover_files()
@@ -700,7 +712,6 @@ def main():
     print("[FEATURES RAW]", feature_names)
     if lc_values:
         print("[LC CODES]", lc_values)
-        # expand LC into LC_<code>
         feature_names_expanded = []
         for f in feature_names:
             if f == "LC":
@@ -759,6 +770,13 @@ def main():
 
     pd.DataFrame(records).to_csv(os.path.join(OUT_DIR, "metrics.csv"), index=False)
     print("[DONE] Metrics saved to metrics.csv")
+
+    # Best-effort geedim async runner close
+    try:
+        import geedim.utils as gd_utils
+        gd_utils.AsyncRunner()._close()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
